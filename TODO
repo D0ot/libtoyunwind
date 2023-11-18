@@ -1,0 +1,22 @@
+# What is indented to be done?
+
+1. local stack unwind and remote stack unwind, local stack unwind first
+2. x86_64 and aarch64, x86_64 first, linux platform only.
+3. api interface: hpux unwind api
+
+
+# Major Steps
+1. [] study local hpux unwind api
+    a. [] how to use local hpux unwind api ?
+
+2. [] study dwarf and dwarf CFI (maybe ELF format is needed)
+    a. [] study CFI directives, to to parse it with hexdump and human eyes...
+    b. [] write a simple lib to parse it
+
+3. [] implement local stack unwind on x86_64
+    a. [] some arch dependent things, maybe things like "getcontext()"
+
+
+# Designs
+
+1. make dwarf CFI related code platform and arch independent
