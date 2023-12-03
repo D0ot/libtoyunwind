@@ -33,7 +33,6 @@ struct cie_entry {
 	u32 cie_id;
 	u64 ext_length; // optional
 	char *aug_str;
-	u32 aug_str_sz;
 	u8 version;
 	u8 aug_flags;
 
@@ -44,7 +43,9 @@ struct cie_entry {
 
 	u64 aug_length;
 	u8 *aug_data;
-	u8 init_insts[];
+
+	u8 *init_insts;
+	u64 init_insts_sz;
 };
 
 struct fde_entry {
@@ -235,9 +236,8 @@ struct eh_frame_hdr_raw *get_ehframehdr_raw(const struct find_segment_data *dat)
 	return hdr;
 }
 
-i32 get_ehframe(const struct find_segment_data *dat, i32 offset, i64 *val) {
+i32 get_ehframe(const struct eh_frame_hdr_raw *hdr, i32 offset, i64 *val) {
 	i64 tmp;
-	struct eh_frame_hdr_raw *hdr = get_ehframehdr_raw(dat);
 	i32 len = read_signed_encode((u8*)hdr + offset, hdr->eh_frame_ptr_enc, &tmp);
 
 	if (len == 0) {
@@ -262,9 +262,8 @@ i32 get_ehframe(const struct find_segment_data *dat, i32 offset, i64 *val) {
 	return len;
 }
 
-i32 get_fde_count(const struct find_segment_data *dat, i32 offset, i64 *val) {
+i32 get_fde_count(const struct eh_frame_hdr_raw *hdr, i32 offset, i64 *val) {
 	i64 tmp;
-	struct eh_frame_hdr_raw *hdr = get_ehframehdr_raw(dat);
 	i32 len = read_signed_encode((u8*)hdr+ offset, hdr->eh_frame_ptr_enc, &tmp);
 
 	if (len == 0) {
@@ -301,9 +300,12 @@ void print_eh_frame_hdr_raw(const struct eh_frame_hdr_raw *hdr) {
 
 
 
+// nonzero: return consumed bytes count
+// zero: terminator CIE entry
 i32 fill_cie_entry(u64 ehframe_ptr, struct cie_entry *cie)
 {
 	u64 ptr = ehframe_ptr;
+	i64 ret = 0;
 	cie->length = *(u32 *)(ptr);
 	ptr += 4;
 	if (cie->length == 0xffffffff) {
@@ -311,7 +313,10 @@ i32 fill_cie_entry(u64 ehframe_ptr, struct cie_entry *cie)
 		ptr += 8;
 	} else if (cie->length == 0) {
 		return 0;
+	} else {
+		cie->ext_length = 0;
 	}
+
 	cie->cie_id = *(u32 *)(ptr);
 	ptr += 4;
 
@@ -353,12 +358,61 @@ i32 fill_cie_entry(u64 ehframe_ptr, struct cie_entry *cie)
 		ptr += cie->aug_length;
 	}
 
-	// TODO: to extract initial instructions
+	cie->init_insts = (u8 *)ptr;
+
+	ret = ptr - ehframe_ptr;
+
+	if (cie->ext_length) {
+		cie->init_insts_sz = cie->ext_length - (ret - sizeof(cie->ext_length) - sizeof(cie->length));
+	} else {
+		cie->init_insts_sz = cie->length - (ret - sizeof(cie->length));
+	}
+
 
 	// return count of used bytes
-	return ptr - ehframe_ptr;
+	return ret;
 }
 
+
+void print_bst(u64 table_ptr, u8 encode, u64 fde_count, const struct eh_frame_hdr_raw *hdr) {
+	i64 initval;
+	i64 address;
+	i64 offset = 0;
+	u64 tmp;
+	u64 ptr = table_ptr;
+
+	if (encode == DW_EH_PE_omit) {
+		return;
+	}
+
+	for (i64 i = 0; i < fde_count; ++i) {
+		// signed when true
+		if (encode & 0x08) {
+			offset = read_signed_encode((u8 *)ptr, encode, &initval);
+			ptr += offset;
+			offset = read_signed_encode((u8 *)ptr, encode, &address);
+			ptr += offset;
+		} else {
+			offset = read_unsigned_encode((u8 *)ptr, encode, &tmp);
+			initval = tmp;
+			ptr += offset;
+			offset = read_unsigned_encode((u8 *)ptr, encode, &tmp);
+			address = tmp;
+			ptr += offset;
+		}
+		printf("BST pairs:\tinitval = %ld, address = %ld\n", initval, address);
+
+		if ((encode & 0xf0) == DW_EH_PE_pcrel) {
+			initval += table_ptr;
+			address += table_ptr;
+		} else if ((encode & 0xf0) == DW_EH_PE_datarel) {
+			initval += (u64)hdr;
+			address += (u64)hdr;
+		}
+
+		printf("\t\tinitval = %lx, address = %lx\n", initval, address);
+	}
+}
 
 void find_ehframehdr(u64 pc) {
 	int ret;
@@ -375,17 +429,23 @@ void find_ehframehdr(u64 pc) {
 
 	print_eh_frame_hdr_raw(get_ehframehdr_raw(&dat));
 
-	i32 offset = sizeof(struct eh_frame_hdr_raw);
 	i64 ehframe_ptr, fde_count;
-	offset += get_ehframe(&dat, offset, &ehframe_ptr);
+	struct eh_frame_hdr_raw *hdr = get_ehframehdr_raw(&dat);
+	i32 offset = sizeof(struct eh_frame_hdr_raw);
+
+	offset += get_ehframe(hdr, offset, &ehframe_ptr);
 	printf("ehframe offset = %d\n", offset);
-	offset += get_fde_count(&dat, offset, &fde_count);
+	offset += get_fde_count(hdr, offset, &fde_count);
 	printf("fde_count offset = %d\n", offset);
 
 	printf("ehframe_ptr = %lx, fde_count = %ld\n", ehframe_ptr, fde_count);
 
+	// TODO: how many CIEs in the ehframe_ptr ?
 	struct cie_entry cie;
 	fill_cie_entry(ehframe_ptr, &cie);
+
+	print_bst((u64)hdr + offset, hdr->table_enc, fde_count, hdr);
+
 
 }
 
