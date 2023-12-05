@@ -51,7 +51,7 @@ struct cie_entry {
 struct fde_entry {
 	u32 length;
 	u64 ext_length; // optional
-	u32 fde_ptr;
+	u32 cie_ptr;
 	u64 pc_begin;
 	u64 pc_range;
 	u64 aug_len;
@@ -302,8 +302,7 @@ void print_eh_frame_hdr_raw(const struct eh_frame_hdr_raw *hdr) {
 
 // nonzero: return consumed bytes count
 // zero: terminator CIE entry
-i32 fill_cie_entry(u64 ehframe_ptr, struct cie_entry *cie)
-{
+i64 fill_cie_entry(u64 ehframe_ptr, struct cie_entry *cie) {
 	u64 ptr = ehframe_ptr;
 	i64 ret = 0;
 	cie->length = *(u32 *)(ptr);
@@ -373,6 +372,29 @@ i32 fill_cie_entry(u64 ehframe_ptr, struct cie_entry *cie)
 	return ret;
 }
 
+i64 fill_fde_entry(u64 fde_ptr, struct fde_entry *fde) {
+	u64 ptr = fde_ptr;
+	i64 ret = 0;
+
+	fde->length = *(u32 *)(ptr);
+	ptr += 4;
+	if (fde->length == 0xffffffff) {
+		fde->ext_length = *(u64 *)(ptr);
+		ptr += 8;
+	} else if (fde->length == 0) {
+		return 0;
+	} else {
+		fde->ext_length = 0;
+	}
+
+	fde->cie_ptr = *(u32 *)ptr;
+	ptr += 4;
+
+	printf("fde->cie_ptr = %u\n", fde->cie_ptr);
+
+	return ptr - fde_ptr;
+}
+
 
 void print_bst(u64 table_ptr, u8 encode, u64 fde_count, const struct eh_frame_hdr_raw *hdr) {
 	i64 initval;
@@ -410,7 +432,9 @@ void print_bst(u64 table_ptr, u8 encode, u64 fde_count, const struct eh_frame_hd
 			address += (u64)hdr;
 		}
 
+		struct fde_entry fde;
 		printf("\t\tinitval = %lx, address = %lx\n", initval, address);
+		fill_fde_entry(address, &fde);
 	}
 }
 
@@ -445,8 +469,6 @@ void find_ehframehdr(u64 pc) {
 	fill_cie_entry(ehframe_ptr, &cie);
 
 	print_bst((u64)hdr + offset, hdr->table_enc, fde_count, hdr);
-
-
 }
 
 u64 get_pc() {
@@ -498,7 +520,7 @@ void stack_unwind_fast() {
 
 int main(int argc, char *argv[]) {
 	u64 rip = get_pc();
-	printf("rip = %lu\n", rip);
+	printf("rip = %p\n", (void *)rip);
 	find_ehframehdr(rip);
 	return EXIT_SUCCESS;
 }

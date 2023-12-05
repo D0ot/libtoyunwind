@@ -1,0 +1,6 @@
+root = true
+
+[*.c]
+charset = utf-8
+indent_size = 8
+indent_style = tab
