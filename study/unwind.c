@@ -46,17 +46,23 @@ struct cie_entry {
 
 	u8 *init_insts;
 	u64 init_insts_sz;
+
+	u8 fde_ptr_enc;
+	u8 lsda_ptr_enc;
+	u8 personality_enc;
+	u64 personality_handler;
 };
 
 struct fde_entry {
 	u32 length;
 	u64 ext_length; // optional
 	u32 cie_ptr;
-	u64 pc_begin;
-	u64 pc_range;
+	i64 pc_begin;
+	i64 pc_range;
 	u64 aug_len;
 	u8 *aug_data;
-	u8 cfi[];
+	u64 cfi_ptr;
+	u64 cfi_sz;
 };
 
 struct eh_frame_hdr_raw {
@@ -82,6 +88,11 @@ struct find_segment_data {
 	ElfW(Addr) base_addr;
 	uint64_t pc;
 };
+
+u64 align_address_unit(u64 ptr) {
+	static_assert(sizeof(void*) == 8, "address unit size is not 8");
+	return (ptr + 7) & ~(0x8 - 1);
+}
 
 i32 read_leb128(u8 *bytes, u64 *val) {
 	i32 i = 0;
@@ -183,7 +194,7 @@ int find_ehframehdr_cb(struct dl_phdr_info *info, size_t size, void *data) {
 }
 
 
-i32 read_signed_encode(u8 *bytes, u8 enc, i64 *val)
+static i32 read_signed_encoded(u8 *bytes, u8 enc, i64 *val)
 {
 	i32 ret = 0;
 	switch (enc & 0x0F) {
@@ -206,7 +217,7 @@ i32 read_signed_encode(u8 *bytes, u8 enc, i64 *val)
 	return ret;
 }
 
-i32 read_unsigned_encode(u8 *bytes, u8 enc, u64 *val) {
+static i32 read_unsigned_encoded(u8 *bytes, u8 enc, u64 *val) {
 	i32 ret = 0;
 	switch (enc & 0x0F) {
 		case DW_EH_PE_uleb128:
@@ -229,6 +240,18 @@ i32 read_unsigned_encode(u8 *bytes, u8 enc, u64 *val) {
 	return ret;
 }
 
+static i32 read_encoded(u8 *bytes, u8 enc, i64 *val) {
+	i32 ret = 0;
+
+	if (enc & 0x08) {
+		ret = read_signed_encoded(bytes, enc, val);
+	} else {
+		ret = read_unsigned_encoded(bytes, enc, (u64 *)val);
+		assert(val > 0);
+	}
+	return ret;
+}
+
 
 struct eh_frame_hdr_raw *get_ehframehdr_raw(const struct find_segment_data *dat) {
 	struct eh_frame_hdr_raw *hdr =
@@ -238,11 +261,7 @@ struct eh_frame_hdr_raw *get_ehframehdr_raw(const struct find_segment_data *dat)
 
 i32 get_ehframe(const struct eh_frame_hdr_raw *hdr, i32 offset, i64 *val) {
 	i64 tmp;
-	i32 len = read_signed_encode((u8*)hdr + offset, hdr->eh_frame_ptr_enc, &tmp);
-
-	if (len == 0) {
-		len = read_unsigned_encode((u8*)hdr + offset, hdr->eh_frame_ptr_enc, (u64*)&tmp);
-	}
+	i32 len = read_encoded((u8*)hdr + offset, hdr->eh_frame_ptr_enc, &tmp);
 
 	switch (hdr->eh_frame_ptr_enc & 0xF0) {
 		case 0:
@@ -264,11 +283,7 @@ i32 get_ehframe(const struct eh_frame_hdr_raw *hdr, i32 offset, i64 *val) {
 
 i32 get_fde_count(const struct eh_frame_hdr_raw *hdr, i32 offset, i64 *val) {
 	i64 tmp;
-	i32 len = read_signed_encode((u8*)hdr+ offset, hdr->eh_frame_ptr_enc, &tmp);
-
-	if (len == 0) {
-		len = read_unsigned_encode((u8*)hdr+ offset, hdr->eh_frame_ptr_enc, (u64*)&tmp);
-	}
+	i32 len = read_encoded((u8*)hdr+ offset, hdr->eh_frame_ptr_enc, &tmp);
 
 	switch (hdr->fde_count_enc & 0xF0) {
 		case 0:
@@ -300,11 +315,11 @@ void print_eh_frame_hdr_raw(const struct eh_frame_hdr_raw *hdr) {
 
 
 
-// nonzero: return consumed bytes count
+// nonzero: return consumed bytes count including the initial instructions
 // zero: terminator CIE entry
 i64 fill_cie_entry(u64 ehframe_ptr, struct cie_entry *cie) {
 	u64 ptr = ehframe_ptr;
-	i64 ret = 0;
+	i64 tmp = 0;
 	cie->length = *(u32 *)(ptr);
 	ptr += 4;
 	if (cie->length == 0xffffffff) {
@@ -318,6 +333,10 @@ i64 fill_cie_entry(u64 ehframe_ptr, struct cie_entry *cie) {
 
 	cie->cie_id = *(u32 *)(ptr);
 	ptr += 4;
+	
+	if (cie->cie_id != 0) {
+		return -1;
+	}
 
 	cie->version = *(u8 *)(ptr);
 	ptr += 1;
@@ -326,6 +345,7 @@ i64 fill_cie_entry(u64 ehframe_ptr, struct cie_entry *cie) {
 
 	cie->aug_flags = 0;
 
+	// TODO: more check and sequence problem
 	while (*(u8 *)(ptr)) {
 
 		char c = *(char*)ptr;
@@ -355,26 +375,41 @@ i64 fill_cie_entry(u64 ehframe_ptr, struct cie_entry *cie) {
 		ptr += read_leb128((u8 *)ptr, &cie->aug_length);
 		cie->aug_data = (u8 *)ptr;
 		ptr += cie->aug_length;
+
+		if (cie->aug_flags & CIE_AUG_STR_R) {
+			cie->fde_ptr_enc = cie->aug_data[0];
+		}
+
 	}
 
 	cie->init_insts = (u8 *)ptr;
 
-	ret = ptr - ehframe_ptr;
+	// TODO: refactor, extract the "instructions sizing and alignment code"
+	// tmp is the structure size w/o initial instructions
+	tmp = ptr - ehframe_ptr;
 
 	if (cie->ext_length) {
-		cie->init_insts_sz = cie->ext_length - (ret - sizeof(cie->ext_length) - sizeof(cie->length));
+		cie->init_insts_sz = cie->ext_length - (tmp - sizeof(cie->ext_length) - sizeof(cie->length));
 	} else {
-		cie->init_insts_sz = cie->length - (ret - sizeof(cie->length));
+		cie->init_insts_sz = cie->length - (tmp - sizeof(cie->length));
 	}
 
-
-	// return count of used bytes
-	return ret;
+	// return count of used bytes including initial instructions and padding
+	return align_address_unit(tmp + cie->init_insts_sz + ehframe_ptr) - ehframe_ptr;
 }
 
-i64 fill_fde_entry(u64 fde_ptr, struct fde_entry *fde) {
+void print_cie_entry(const struct cie_entry *cie) {
+	printf("CIE\n");
+}
+
+void print_fde_entry(const struct fde_entry *fde) {
+	printf("FDE, %lx, %lx\n", fde->pc_begin, fde->pc_begin + fde->pc_range);
+}
+
+// return the sizeof this fde
+i64 fill_fde_entry(u64 fde_ptr, const struct cie_entry *cie, struct fde_entry *fde) {
 	u64 ptr = fde_ptr;
-	i64 ret = 0;
+	i64 tmp = 0;
 
 	fde->length = *(u32 *)(ptr);
 	ptr += 4;
@@ -390,13 +425,39 @@ i64 fill_fde_entry(u64 fde_ptr, struct fde_entry *fde) {
 	fde->cie_ptr = *(u32 *)ptr;
 	ptr += 4;
 
-	printf("fde->cie_ptr = %u\n", fde->cie_ptr);
+	if (fde->cie_ptr == 0) {
+		return -1;
+	}
 
-	return ptr - fde_ptr;
+	ptr += read_encoded((u8 *)ptr, cie->fde_ptr_enc, &fde->pc_begin);
+
+	ptr += read_encoded((u8 *)ptr, cie->fde_ptr_enc, &fde->pc_range);
+
+	if (cie->aug_flags & CIE_AUG_STR_z) {
+		ptr += read_leb128((u8 *)ptr, &fde->aug_len);
+		fde->aug_data = (u8 *)ptr;
+		ptr += fde->aug_len;
+	}
+
+	fde->cfi_ptr = ptr;
+
+	// TODO: refactor, extract the "instructions sizing and alignment code"
+	// tmp is the structure size w/o CFI 
+	tmp = ptr - fde_ptr;
+
+	if (fde->ext_length) {
+		fde->cfi_sz = fde->ext_length - (tmp - sizeof(fde->ext_length) - sizeof(fde->length));
+	} else {
+		fde->cfi_sz = fde->length - (tmp - sizeof(fde->length));
+	}
+
+	// return count of used bytes including CFI and padding
+	return align_address_unit(tmp + fde->cfi_sz + fde_ptr) - fde_ptr;
 }
 
 
-void print_bst(u64 table_ptr, u8 encode, u64 fde_count, const struct eh_frame_hdr_raw *hdr) {
+void print_bst(u64 table_ptr, u8 encode, u64 fde_count, const struct eh_frame_hdr_raw *hdr,
+		const struct cie_entry *cie) {
 	i64 initval;
 	i64 address;
 	i64 offset = 0;
@@ -408,20 +469,11 @@ void print_bst(u64 table_ptr, u8 encode, u64 fde_count, const struct eh_frame_hd
 	}
 
 	for (i64 i = 0; i < fde_count; ++i) {
-		// signed when true
-		if (encode & 0x08) {
-			offset = read_signed_encode((u8 *)ptr, encode, &initval);
-			ptr += offset;
-			offset = read_signed_encode((u8 *)ptr, encode, &address);
-			ptr += offset;
-		} else {
-			offset = read_unsigned_encode((u8 *)ptr, encode, &tmp);
-			initval = tmp;
-			ptr += offset;
-			offset = read_unsigned_encode((u8 *)ptr, encode, &tmp);
-			address = tmp;
-			ptr += offset;
-		}
+		offset = read_encoded((u8 *)ptr, encode, &initval);
+		ptr += offset;
+		offset = read_encoded((u8 *)ptr, encode, &address);
+		ptr += offset;
+
 		printf("BST pairs:\tinitval = %ld, address = %ld\n", initval, address);
 
 		if ((encode & 0xf0) == DW_EH_PE_pcrel) {
@@ -434,7 +486,7 @@ void print_bst(u64 table_ptr, u8 encode, u64 fde_count, const struct eh_frame_hd
 
 		struct fde_entry fde;
 		printf("\t\tinitval = %lx, address = %lx\n", initval, address);
-		fill_fde_entry(address, &fde);
+		fill_fde_entry(address, cie, &fde);
 	}
 }
 
@@ -466,9 +518,39 @@ void find_ehframehdr(u64 pc) {
 
 	// TODO: how many CIEs in the ehframe_ptr ?
 	struct cie_entry cie;
-	fill_cie_entry(ehframe_ptr, &cie);
+	struct fde_entry fde;
+	i64 new_offset = 0;
+	u64 ptr = ehframe_ptr;
 
-	print_bst((u64)hdr + offset, hdr->table_enc, fde_count, hdr);
+	bool is_fde = false;
+	for(;;) {
+		if (is_fde) {
+			new_offset = fill_fde_entry(ptr, &cie, &fde);
+			if (new_offset == 0) {
+				break;
+			} else if (new_offset < 0) {
+				is_fde = false;
+			} else {
+				print_fde_entry(&fde);
+				ptr += new_offset;
+			}
+
+		} else {
+			new_offset = fill_cie_entry(ptr, &cie);
+			if (new_offset == 0) {
+				break;
+			} else if (new_offset < 0) {
+				is_fde = true;
+			} else {
+				print_cie_entry(&cie);
+				ptr += new_offset;
+				is_fde = true;
+			}
+		}
+	}
+
+
+	print_bst((u64)hdr + offset, hdr->table_enc, fde_count, hdr, (struct cie_entry *)ehframe_ptr);
 }
 
 u64 get_pc() {
