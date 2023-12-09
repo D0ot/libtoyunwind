@@ -751,7 +751,7 @@ i64 fill_cie_entry(u64 ehframe_ptr, struct cie_entry *cie) {
 	}
 
 	// return count of used bytes including initial instructions and padding
-	return align_address_unit(tmp + cie->init_insts_sz + ehframe_ptr) - ehframe_ptr;
+	return tmp + cie->init_insts_sz;
 }
 
 void print_cie_entry(const struct cie_entry *cie) {
@@ -759,7 +759,7 @@ void print_cie_entry(const struct cie_entry *cie) {
 }
 
 void print_fde_entry(const struct fde_entry *fde) {
-	printf("FDE, %ld, %ld\n", fde->pc_begin, fde->pc_begin + fde->pc_range);
+	printf("FDE, 0x%lx, 0x%lx\n", fde->pc_begin, fde->pc_range);
 }
 
 // return the sizeof this fde
@@ -787,11 +787,11 @@ i64 fill_fde_entry(u64 fde_ptr, const struct cie_entry *cie, struct fde_entry *f
 	}
 
 	struct eh_decode_ctx ctx;
-	ctx.pc = ptr;
+	ctx.pc = 0xffff;
 	ptr += read_encoded((u8 *)ptr, cie->fde_ptr_enc, &fde->pc_begin, &ctx);
 
-	ctx.pc = ptr;
-	ptr += read_encoded((u8 *)ptr, cie->fde_ptr_enc, &fde->pc_range, &ctx);
+	fde->pc_range = *(u32 *)ptr;
+	ptr += 4;
 
 	if (cie->aug_flags & CIE_AUG_STR_z) {
 		ptr += read_leb128((u8 *)ptr, &fde->aug_len);
@@ -812,7 +812,7 @@ i64 fill_fde_entry(u64 fde_ptr, const struct cie_entry *cie, struct fde_entry *f
 	}
 
 	// return count of used bytes including CFI and padding
-	return align_address_unit(tmp + fde->cfi_sz + fde_ptr) - fde_ptr;
+	return tmp + fde->cfi_sz;
 }
 
 
