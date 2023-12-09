@@ -2,7 +2,6 @@
 
 #define _GNU_SOURCE
 
-#include <dwarf.h>
 #include <link.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -12,6 +11,7 @@
 #include <assert.h>
 #include <sys/ucontext.h>
 #include <ucontext.h>
+#include <dwarf.h>
 
 typedef uint8_t u8;
 typedef int8_t i8;
@@ -73,6 +73,14 @@ struct eh_frame_hdr_raw {
 	u8 encode[];
 } __attribute__((packed));
 
+
+struct eh_decode_ctx {
+	u64 pc;
+	u64 text;
+	u64 data;
+	u64 func;
+};
+
 struct tunw_context_t {
 	ucontext_t uctx;
 };
@@ -87,6 +95,37 @@ struct find_segment_data {
 	ElfW(Phdr) dlpi_phdr;
 	ElfW(Addr) base_addr;
 	uint64_t pc;
+};
+
+#define DW_EH_REGS_MAX 64
+
+enum eh_reg_type {
+	REG_UNDEF,
+	REG_SAME_VAL,
+	REG_OFFSET,
+	REG_VAL_OFFSET,
+	REG_REGISTER,
+	REG_EXP,
+	REG_VAL_EXP
+};
+
+struct eh_cfi_row {
+	u64 loc;
+	i64 reg_offset[DW_EH_REGS_MAX];
+	enum eh_reg_type reg_type[DW_EH_REGS_MAX];
+	i64 cfa_reg;
+	i64 cfa_offset;
+};
+
+struct eh_cfi_ctx {
+	struct cie_entry *cie;
+	struct eh_cfi_row *cur;
+	struct eh_cfi_row *init;
+
+	struct eh_cfi_row *stack;
+
+	struct eh_cfi_row *hist;
+	u64 hist_len;
 };
 
 u64 align_address_unit(u64 ptr) {
@@ -132,6 +171,320 @@ i32 read_sleb128(u8 *bytes, i64 *val) {
 	}
 
 	return i;
+}
+
+void print_eh_cfi_row(struct eh_cfi_ctx *ctx) {
+	printf("%16lx cfa=[%lx+%ld]\t", ctx->cur->loc, ctx->cur->cfa_reg, ctx->cur->cfa_offset);
+	for (i32 i = 0; i < DW_EH_REGS_MAX; ++i) {
+		if (ctx->cur->reg_type[i] == REG_OFFSET) {
+			printf("reg_%d=[c + %ld] ", i, ctx->cur->reg_offset[i]);
+		}
+	}
+	putchar('\n');
+}
+
+void cfi_new_col(struct eh_cfi_ctx *ctx, u64 loc) {
+	struct eh_cfi_row *tmp;
+	ctx->hist_len++;
+	tmp = realloc(ctx->hist, sizeof(struct eh_cfi_row) * ctx->hist_len);
+	assert(tmp != NULL);
+	ctx->hist = tmp;
+	ctx->cur = ctx->hist + ctx->hist_len - 1;
+	memcpy(ctx->cur, ctx->cur - 1, sizeof(struct eh_cfi_row));
+	ctx->cur->loc = loc;
+}
+ 
+i32 cfi_advance_loc(struct eh_cfi_ctx *ctx, i8 offset) {
+	cfi_new_col(ctx, ctx->cur->loc + offset);
+	return 0;
+};
+
+i32 cfi_offset(struct eh_cfi_ctx *ctx, u8 low6bits, u8 *bytes) {
+	i32 ret;
+	ctx->cur->reg_type[low6bits] = REG_OFFSET;
+	ret = read_leb128(bytes, (u64 *)&(ctx->cur->reg_offset[low6bits]));
+	assert(ctx->cur->reg_offset[low6bits] > 0);
+	return ret;
+}
+
+i32 cfi_restore(struct eh_cfi_ctx *ctx, u64 low6bits) {
+	ctx->cur->reg_type[low6bits] = ctx->init->reg_type[low6bits];
+	ctx->cur->reg_offset[low6bits] = ctx->init->reg_type[low6bits];
+	return 1;
+}
+
+typedef i32 (*cfi_func)(struct eh_cfi_ctx *ctx, u8 *bytes);
+
+i32 cfi_nop(struct eh_cfi_ctx *ctx, u8 *bytes) {
+	return 0;
+}
+
+i32 cfi_set_loc(struct eh_cfi_ctx *ctx, u8 *bytes) {
+	cfi_new_col(ctx, *(u64 *)bytes + ctx->cur->loc);
+	return sizeof(void*);
+}
+
+i32 cfi_advance_loc1(struct eh_cfi_ctx *ctx, u8 *bytes) {
+	cfi_new_col(ctx, *(i8 *)bytes + ctx->cur->loc);
+	return 1;
+}
+
+i32 cfi_advance_loc2(struct eh_cfi_ctx *ctx, u8 *bytes) {
+	cfi_new_col(ctx, *(i16 *)bytes + ctx->cur->loc);
+	return 2;
+}
+
+i32 cfi_advance_loc4(struct eh_cfi_ctx *ctx, u8 *bytes) {
+	cfi_new_col(ctx, *(i32 *)bytes + ctx->cur->loc);
+	return 4;
+}
+
+i32 cfi_offset_ext(struct eh_cfi_ctx *ctx, u8 *bytes) {
+	u64 reg, offset;
+	i32 ret = 0;
+	ret += read_leb128(bytes, &reg);
+	ret += read_leb128(bytes + ret, &offset);
+	return ret;
+}
+
+
+i32 cfi_restore_ext(struct eh_cfi_ctx *ctx, u8 *bytes) {
+	i32 ret = 0;
+	u64 reg;
+	ret = read_leb128(bytes, &reg);
+	ctx->cur->reg_type[reg] = ctx->init->reg_type[reg];
+	ctx->cur->reg_offset[reg] = ctx->init->reg_type[reg];
+	return ret;
+}
+
+i32 cfi_remember_state(struct eh_cfi_ctx *ctx, u8 *bytes) {
+	assert(0);
+	return 0;
+}
+
+i32 cfi_restore_state(struct eh_cfi_ctx *ctx, u8 *bytes) {
+	assert(0);
+	return 0;
+}
+
+i32 cfi_undef(struct eh_cfi_ctx *ctx, u8 *bytes) {
+	i32 ret = 0;
+	u64 reg;
+	ret = read_leb128(bytes, &reg);
+	ctx->cur->reg_type[reg] = REG_UNDEF;
+	return ret;
+}
+
+i32 cfi_same_value(struct eh_cfi_ctx *ctx, u8 *bytes) {
+	i32 ret = 0;
+	u64 reg;
+	ret = read_leb128(bytes, &reg);
+	ctx->cur->reg_type[reg] = REG_SAME_VAL;
+	return ret;
+}
+
+i32 cfi_register(struct eh_cfi_ctx *ctx, u8 *bytes) {
+	i32 ret = 0;
+	u64 reg1, reg2;
+	ret += read_leb128(bytes, &reg1);
+	ret += read_leb128(bytes + ret, &reg2);
+	ctx->cur->reg_type[reg1] = REG_REGISTER;
+	ctx->cur->reg_offset[reg1] = reg2;
+	return ret;
+}
+
+
+i32 cfi_def_cfa(struct eh_cfi_ctx *ctx, u8 *bytes) {
+	u64 reg, offset;
+	i32 ret = 0;
+	ret = read_leb128(bytes, &reg);
+	ret += read_leb128(bytes, &offset);
+	ctx->cur->cfa_reg = reg;
+	ctx->cur->cfa_offset = offset;
+	return ret;
+}
+
+i32 cfi_def_cfa_register(struct eh_cfi_ctx *ctx, u8 *bytes) {
+	u64 reg;
+	i32 ret = 0;
+	ret = read_leb128(bytes, &reg);
+	ctx->cur->cfa_reg = reg;
+	return ret;
+}
+
+i32 cfi_def_cfa_offset(struct eh_cfi_ctx *ctx, u8 *bytes) {
+	u64 offset;
+	i32 ret = 0;
+	ret = read_leb128(bytes, &offset);
+	ctx->cur->cfa_offset = offset;
+	return ret;
+}
+
+i32 cfi_def_cfa_expression(struct eh_cfi_ctx *ctx, u8 *bytes) {
+	assert(0);
+	return 0;
+}
+
+i32 cfi_expression(struct eh_cfi_ctx *ctx, u8 *bytes) {
+	assert(0);
+	return 0;
+}
+
+i32 cfi_offset_ext_sf(struct eh_cfi_ctx *ctx, u8 *bytes) {
+	i64 offset;
+	u64 reg;
+	i32 ret = 0;
+	ret += read_leb128(bytes, &reg);
+	ret += read_sleb128(bytes, &offset);
+	ctx->cur->reg_offset[reg] = offset * ctx->cie->data_align_factor;
+	return ret;
+}
+
+i32 cfi_def_cfa_sf(struct eh_cfi_ctx *ctx, u8 *bytes) {
+	i64 offset;
+	u64 reg;
+	i32 ret = 0;
+	ret += read_leb128(bytes, &reg);
+	ret += read_sleb128(bytes, &offset);
+	ctx->cur->cfa_offset = offset * ctx->cie->data_align_factor;
+	ctx->cur->cfa_reg = reg;
+	return ret;
+}
+
+i32 cfi_def_cfa_offset_sf(struct eh_cfi_ctx *ctx, u8 *bytes) {
+	i64 offset;
+	i32 ret = 0;
+	ret += read_sleb128(bytes, &offset);
+	ctx->cur->cfa_offset = offset * ctx->cie->data_align_factor;
+	return ret;
+}
+i32 cfi_val_offset(struct eh_cfi_ctx *ctx, u8 *bytes) {
+	u64 reg, offset;
+	i32 ret = 0;
+	ret += read_leb128(bytes, &reg);
+	ret += read_leb128(bytes, &offset);
+	ctx->cur->reg_type[reg] = REG_VAL_OFFSET;
+	ctx->cur->reg_offset[reg] = offset;
+	return ret;
+}
+
+i32 cfi_val_offset_sf(struct eh_cfi_ctx *ctx, u8 *bytes) {
+	u64 reg;
+	i64 offset;
+	i32 ret = 0;
+	ret += read_leb128(bytes, &reg);
+	ret += read_sleb128(bytes, &offset);
+	ctx->cur->reg_type[reg] = REG_VAL_OFFSET;
+	ctx->cur->reg_offset[reg] = offset * ctx->cie->data_align_factor;
+	return 0;
+}
+
+i32 cfi_val_expression(struct eh_cfi_ctx *ctx, u8 *bytes) {
+	return 0;
+}
+
+cfi_func cfi_func_tables[] = {
+	cfi_nop,
+	cfi_set_loc,
+	cfi_advance_loc1,
+	cfi_advance_loc2,
+	cfi_advance_loc4,
+	cfi_offset_ext,
+	cfi_restore_ext,
+	cfi_remember_state,
+	cfi_undef,
+	cfi_same_value,
+	cfi_register,
+	cfi_remember_state,
+	cfi_restore_state,
+	cfi_def_cfa,
+	cfi_def_cfa_register,
+	cfi_def_cfa_offset,
+	cfi_def_cfa_expression,
+	cfi_expression,
+	cfi_offset_ext_sf,
+	cfi_def_cfa_sf,
+	cfi_def_cfa_offset_sf,
+	cfi_val_offset,
+	cfi_val_offset_sf,
+	cfi_val_expression,
+};
+
+
+i32 cfi_single_step(struct eh_cfi_ctx *ctx, u8 *bytes) {
+
+	u8 *ptr = bytes;
+	i32 ret = 0;
+	u8 opcode = ptr[0];
+	u8 high2bits = opcode & 0xC0;
+	u8 low6bits = opcode & 0x3F;
+	if (high2bits) {
+		switch (high2bits) {
+			case DW_CFA_advance_loc:
+				ret = cfi_advance_loc(ctx, low6bits);
+				break;
+			case DW_CFA_offset:
+				ret = cfi_offset(ctx, low6bits, ptr);
+				break;
+			case DW_CFA_restore:
+				ret = cfi_restore(ctx, low6bits);
+				break;
+		}
+	} else {
+		if (low6bits <= DW_CFA_val_expression) {
+			ret = cfi_func_tables[low6bits](ctx, bytes);
+		}
+	}
+
+	return ret + 1;
+}
+
+void cfi_steps(struct eh_cfi_ctx *ctx, u8 *bytes, u64 len) {
+	u64 acc_offset = 0;
+	
+	while (acc_offset < len) {
+		acc_offset += cfi_single_step(ctx, bytes + acc_offset);
+	}
+	assert(acc_offset == len);
+};
+
+struct eh_cfi_ctx *cfi_ctx_init(struct cie_entry *cie) {
+	struct eh_cfi_ctx *ctx;
+	ctx = malloc(sizeof(struct eh_cfi_ctx));
+	memset(ctx, 0, sizeof(struct eh_cfi_ctx));
+
+	ctx->hist_len = 1;
+	ctx->hist = malloc(sizeof(struct eh_cfi_row) * ctx->hist_len);
+	memset(ctx->hist, 0, sizeof(struct eh_cfi_row) * ctx->hist_len);
+
+	ctx->init = malloc(sizeof(struct eh_cfi_row));
+	memset(ctx->hist, 0, sizeof(struct eh_cfi_row));
+
+	ctx->stack = NULL;
+	ctx->cur = ctx->hist;
+
+	cfi_steps(ctx, cie->init_insts, cie->init_insts_sz);
+	memcpy(ctx->init, ctx->hist, sizeof(struct eh_cfi_row));
+	return ctx;
+}
+
+void cfi_ctx_push(struct eh_cfi_ctx *ctx) {
+	// no impl
+	assert(0);
+}
+
+void cfi_ctx_pop(struct eh_cfi_ctx *ctx) {
+	// no impl
+	assert(0);
+}
+
+void cfi_ctx_done(struct eh_cfi_ctx *ctx) {
+	free(ctx->hist);
+	if (ctx->stack) {
+		free(ctx->stack);
+	}
+	free(ctx->init);
+	free(ctx);
 }
 
 void test_leb() {
@@ -193,8 +546,7 @@ int find_ehframehdr_cb(struct dl_phdr_info *info, size_t size, void *data) {
 	return 0;
 }
 
-
-static i32 read_signed_encoded(u8 *bytes, u8 enc, i64 *val)
+static i32 read_format_signed(u8 *bytes, u8 enc, i64 *val)
 {
 	i32 ret = 0;
 	switch (enc & 0x0F) {
@@ -217,7 +569,7 @@ static i32 read_signed_encoded(u8 *bytes, u8 enc, i64 *val)
 	return ret;
 }
 
-static i32 read_unsigned_encoded(u8 *bytes, u8 enc, u64 *val) {
+static i32 read_format_unsigned(u8 *bytes, u8 enc, u64 *val) {
 	i32 ret = 0;
 	switch (enc & 0x0F) {
 		case DW_EH_PE_uleb128:
@@ -240,18 +592,54 @@ static i32 read_unsigned_encoded(u8 *bytes, u8 enc, u64 *val) {
 	return ret;
 }
 
-static i32 read_encoded(u8 *bytes, u8 enc, i64 *val) {
+static i32 read_format_encoded(u8 *bytes, u8 enc, i64 *val) {
 	i32 ret = 0;
 
 	if (enc & 0x08) {
-		ret = read_signed_encoded(bytes, enc, val);
+		ret = read_format_signed(bytes, enc, val);
 	} else {
-		ret = read_unsigned_encoded(bytes, enc, (u64 *)val);
+		ret = read_format_unsigned(bytes, enc, (u64 *)val);
 		assert(val > 0);
 	}
 	return ret;
 }
 
+static i32 encoded_data_present(u8 enc) {
+	return enc != DW_EH_PE_omit;
+}
+
+static i32 read_encoded(u8 *bytes, u8 enc, i64 *val, const struct eh_decode_ctx *ctx) {
+	i64 tmp;
+	i32 ret;
+	
+	if (enc == DW_EH_PE_omit) {
+		return 0;
+	}
+
+	ret = read_format_encoded(bytes, enc, &tmp);
+
+	switch (enc & 0xF0) {
+		case DW_EH_PE_absptr:
+			*val = tmp;
+			break;
+		case DW_EH_PE_pcrel:
+			*val = tmp + ctx->pc;
+			break;
+		case DW_EH_PE_textrel:
+			*val = tmp + ctx->text;
+			break;
+		case DW_EH_PE_datarel:
+			*val = tmp + ctx->data;
+			break;
+		case DW_EH_PE_funcrel:
+			*val = tmp + ctx->func;
+			break;
+		case DW_EH_PE_aligned:
+			*val = align_address_unit(tmp);
+			break;
+	}
+	return ret;
+}
 
 struct eh_frame_hdr_raw *get_ehframehdr_raw(const struct find_segment_data *dat) {
 	struct eh_frame_hdr_raw *hdr =
@@ -260,47 +648,15 @@ struct eh_frame_hdr_raw *get_ehframehdr_raw(const struct find_segment_data *dat)
 }
 
 i32 get_ehframe(const struct eh_frame_hdr_raw *hdr, i32 offset, i64 *val) {
-	i64 tmp;
-	i32 len = read_encoded((u8*)hdr + offset, hdr->eh_frame_ptr_enc, &tmp);
-
-	switch (hdr->eh_frame_ptr_enc & 0xF0) {
-		case 0:
-			*val = tmp;
-			break;
-		case DW_EH_PE_pcrel:
-			*val = (u64)(&hdr->encode) + tmp;
-			break;
-		case DW_EH_PE_textrel:
-		case DW_EH_PE_datarel:
-		case DW_EH_PE_funcrel:
-		case DW_EH_PE_aligned:
-			*val = 0;
-			break;
-	}
-
-	return len;
+	struct eh_decode_ctx ctx;
+	ctx.pc = (u64)&hdr->encode;
+	return read_encoded((u8 *)hdr + offset, hdr->eh_frame_ptr_enc, val, &ctx);
 }
 
 i32 get_fde_count(const struct eh_frame_hdr_raw *hdr, i32 offset, i64 *val) {
-	i64 tmp;
-	i32 len = read_encoded((u8*)hdr+ offset, hdr->eh_frame_ptr_enc, &tmp);
-
-	switch (hdr->fde_count_enc & 0xF0) {
-		case 0:
-			*val = tmp;
-			break;
-		case DW_EH_PE_pcrel:
-			*val = (u64)(&hdr->encode) + tmp;
-			break;
-		case DW_EH_PE_textrel:
-		case DW_EH_PE_datarel:
-		case DW_EH_PE_funcrel:
-		case DW_EH_PE_aligned:
-			*val = 0;
-			break;
-	}
-	return len;
-
+	struct eh_decode_ctx ctx;
+	ctx.pc = (u64)&hdr->encode;
+	return read_encoded((u8 *)hdr + offset, hdr->fde_count_enc, val, &ctx);
 }
 
 i32 find_fde(const struct find_segment_data *dat) {
@@ -403,13 +759,14 @@ void print_cie_entry(const struct cie_entry *cie) {
 }
 
 void print_fde_entry(const struct fde_entry *fde) {
-	printf("FDE, %lx, %lx\n", fde->pc_begin, fde->pc_begin + fde->pc_range);
+	printf("FDE, %ld, %ld\n", fde->pc_begin, fde->pc_begin + fde->pc_range);
 }
 
 // return the sizeof this fde
 i64 fill_fde_entry(u64 fde_ptr, const struct cie_entry *cie, struct fde_entry *fde) {
 	u64 ptr = fde_ptr;
 	i64 tmp = 0;
+	u8 fde_ptr_enc;
 
 	fde->length = *(u32 *)(ptr);
 	ptr += 4;
@@ -429,9 +786,12 @@ i64 fill_fde_entry(u64 fde_ptr, const struct cie_entry *cie, struct fde_entry *f
 		return -1;
 	}
 
-	ptr += read_encoded((u8 *)ptr, cie->fde_ptr_enc, &fde->pc_begin);
+	struct eh_decode_ctx ctx;
+	ctx.pc = ptr;
+	ptr += read_encoded((u8 *)ptr, cie->fde_ptr_enc, &fde->pc_begin, &ctx);
 
-	ptr += read_encoded((u8 *)ptr, cie->fde_ptr_enc, &fde->pc_range);
+	ctx.pc = ptr;
+	ptr += read_encoded((u8 *)ptr, cie->fde_ptr_enc, &fde->pc_range, &ctx);
 
 	if (cie->aug_flags & CIE_AUG_STR_z) {
 		ptr += read_leb128((u8 *)ptr, &fde->aug_len);
@@ -469,9 +829,9 @@ void print_bst(u64 table_ptr, u8 encode, u64 fde_count, const struct eh_frame_hd
 	}
 
 	for (i64 i = 0; i < fde_count; ++i) {
-		offset = read_encoded((u8 *)ptr, encode, &initval);
+		offset = read_format_encoded((u8 *)ptr, encode, &initval);
 		ptr += offset;
-		offset = read_encoded((u8 *)ptr, encode, &address);
+		offset = read_format_encoded((u8 *)ptr, encode, &address);
 		ptr += offset;
 
 		printf("BST pairs:\tinitval = %ld, address = %ld\n", initval, address);
